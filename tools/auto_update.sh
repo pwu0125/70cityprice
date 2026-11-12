@@ -63,9 +63,36 @@ fi
 
 _log "✅ Page fetched ($(echo "$NBS_PAGE" | wc -c) bytes)"
 
-# ── Step 2: Extract latest 70-city link ────────────────────
-# Strategy: find <a> tags where href and title/text mention "70个大中城市"
-# macOS grep: no -P, use -oE with basic regex
+# ── Step 2: 定位最新的 70 城条目 ────────────────────────────
+# 2026-11-12 实测（P5）：统计局的 /sj/zxfb/ 首页只列 15 条，70 城条目
+# 发布后 3~5 天就被新发布挤出首页 → 只 grep 首页会造成「漏采即永久无法自动追补」
+# （2026 年 7 月数据漏采、靠人工补录，即此机制）。
+# 分页 index_N.html 每页约 1 个月，翻 3 页 ≈ 3 个月追补窗。
+# 抓不到条目现在按异常上报（exit 3），不再与「官方未发布」混为一谈（D3）。
+
+fetch_page() {
+    # 抓取一页：curl 优先，空则回退 python requests
+    local url="$1"
+    local html
+    html=$(curl -sL --max-time 30 \
+        -H "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36" \
+        "$url" 2>> "$LOGFILE")
+    if [ -z "$html" ]; then
+        html=$(PAGE_URL="$url" $PYTHON -c "
+import os
+import requests
+try:
+    r = requests.get(os.environ['PAGE_URL'], timeout=30,
+        headers={'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'})
+    r.raise_for_status()
+    print(r.text)
+except Exception as e:
+    print(f'ERROR: {e}', file=__import__('sys').stderr)
+    exit(1)
+" 2>> "$LOGFILE")
+    fi
+    printf '%s' "$html"
+}
 
 extract_href() {
     # Input: HTML page
@@ -105,14 +132,39 @@ extract_href() {
     echo "$href"
 }
 
-RELATIVE_URL=$(extract_href "$NBS_PAGE")
+PAGE_CANDIDATES=("$NBS_PAGE_URL" "${NBS_PAGE_URL}index_1.html" "${NBS_PAGE_URL}index_2.html" "${NBS_PAGE_URL}index_3.html")
+
+RELATIVE_URL=""
+HIT_PAGE=""
+for i in 0 1 2 3; do
+    PAGE_URL="${PAGE_CANDIDATES[$i]}"
+    if [ "$i" -eq 0 ]; then
+        PAGE_HTML="$NBS_PAGE"
+        PAGE_LABEL="首页"
+    else
+        PAGE_HTML=$(fetch_page "$PAGE_URL")
+        PAGE_LABEL="回退页 index_$i"
+        if [ -z "$PAGE_HTML" ]; then
+            _log "⚠️  ${PAGE_LABEL}（$PAGE_URL）抓取失败，跳过"
+            continue
+        fi
+    fi
+    RELATIVE_URL=$(extract_href "$PAGE_HTML")
+    if [ -n "$RELATIVE_URL" ]; then
+        HIT_PAGE="$i"
+        _log "🔗 命中${PAGE_LABEL}：$RELATIVE_URL"
+        break
+    fi
+    _log "🔎 ${PAGE_LABEL}无 70 城条目，继续回退"
+done
 
 if [ -z "$RELATIVE_URL" ]; then
-    _log "❌ Could not find 70-city data link on NBS page"
-    _log "   Page may have changed format, or data not yet published"
-    _log "   Try checking: $NBS_PAGE_URL"
-    exit 0  # Non-error exit: data simply not published yet this month
+    _log "❌ 未在首页及 index_1~index_3（近约 3 个月）找到 70 个大中城市条目——按异常上报"
+    _log "   可能原因：页面格式变更 / 网络或反爬拦截 / 关键词口径变化"
+    _log "   人工核查：$NBS_PAGE_URL"
+    exit 3
 fi
+_log "📄 命中页序号：${HIT_PAGE}（0=首页，越大越久远）"
 
 _log "🔗 Found relative URL: $RELATIVE_URL"
 
